@@ -1,0 +1,19 @@
+# Datasets are never committed (download links in README)
+data/*
+!data/README.md
+
+# Model weights are large; publish them as a GitHub Release or on Zenodo instead
+*.pt
+*.pth
+*.tflite
+*.onnx
+
+# Scratch runs (copy finished runs into results/ to commit them)
+runs/
+
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+crop/
+.DS_Store
