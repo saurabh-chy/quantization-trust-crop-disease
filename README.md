@@ -18,6 +18,10 @@ Download the datasets as described in `data/README.md`.
 
 ## Pilot: FP32 vs INT8, lab vs field
 
+**Easiest:** open `pilot.ipynb` in Jupyter or Colab and run the cells top to bottom. It downloads the data, runs a quick test, the full pilot, shows the verdict, and copies results into `results/`.
+
+Or from the command line:
+
 ```bash
 python pilot.py --pv data/plantvillage/color --pd data/PlantDoc-Dataset --out runs/pilot_seed0 --seed 0 --workers 2
 ```
@@ -41,6 +45,7 @@ git add results/pilot_seed0 && git commit -m "Add pilot results, seed 0" && git 
 | Path | Contents |
 | --- | --- |
 | `pilot.py` | Pilot experiment (train, quantize, evaluate) |
+| `pilot.ipynb` | Notebook that runs the whole pilot end to end |
 | `results/` | Metrics, plots and logits for each finished run |
 | `data/` | Dataset download instructions (data itself is not committed) |
 
