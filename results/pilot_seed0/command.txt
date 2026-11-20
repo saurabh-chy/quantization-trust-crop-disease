@@ -1,0 +1,4 @@
+python pilot.py --pv <PlantVillage raw/color> --pd <PlantDoc-Dataset> --out runs/pilot_seed0 --workers 0 --bs 64 --seed 0
+Defaults: --epochs 5 --max-per-class 400 --calib-n 256 --boot 1000, ImageNet-pretrained MobileNetV3-Large.
+Run on the author's Windows laptop (6 GB GPU), 20 Nov 2026. INT8 mode: real (PyTorch CPU integer kernels).
+logits.npz not included in this commit.
