@@ -1,10 +1,13 @@
 """
-Pilot: does INT8 post-training quantization hurt "knowing when it's wrong"
-more on field images (PlantDoc) than on lab images (PlantVillage)?
+Pilot: does quantization hurt "knowing when it's wrong" more on field images
+(PlantDoc) than on lab images (PlantVillage)?
 
-One model (MobileNetV3-Large), one seed, FP32 vs INT8 static PTQ.
-Outputs: metrics table, bootstrap CIs on the shift gap, flip-rate by
-confidence bin, risk-coverage plot, and a GO / NO-GO hint.
+One model (MobileNetV3-Large), one seed. FP32 vs INT8 static PTQ (real integer
+kernels where they work, else exact simulation) vs INT4 weights / INT8
+activations (simulated). Temperatures fitted on lab validation (source) and on a
+small labeled PlantDoc split (field); the rest of PlantDoc is the field test set.
+Outputs: metrics table, bootstrap CIs on the shift gap, flip rate by confidence
+bin, risk-coverage plot, and a GO / NULL hint per variant.
 
 Usage:
   python pilot.py --pv /data/plantvillage/color --pd /data/PlantDoc-Dataset --out runs/pilot
@@ -12,7 +15,7 @@ Usage:
   --pv  folder with one sub-folder per PlantVillage class
   --pd  PlantDoc root containing train/ and test/ (one sub-folder per class)
 
-Stages are cached in --out, so re-running skips training/conversion.
+Stages are cached in --out and reused only if the settings are unchanged.
 """
 import argparse, copy, json, os, random, re, time, warnings
 from pathlib import Path
@@ -153,8 +156,16 @@ class Files(Dataset):
 
 
 MEAN, STD = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
-TF_TRAIN = T.Compose([T.RandomResizedCrop(224, scale=(0.6, 1.0)), T.RandomHorizontalFlip(),
+TF_PLAIN = T.Compose([T.RandomResizedCrop(224, scale=(0.6, 1.0)), T.RandomHorizontalFlip(),
                       T.ColorJitter(0.3, 0.3, 0.3, 0.05), T.ToTensor(), T.Normalize(MEAN, STD)])
+# Robust: imitate field conditions (scale, framing, lighting, blur, occlusion) using lab images only.
+TF_ROBUST = T.Compose([T.RandomResizedCrop(224, scale=(0.25, 1.0)), T.RandomHorizontalFlip(),
+                       T.RandomVerticalFlip(), T.RandomRotation(20),
+                       T.RandAugment(num_ops=2, magnitude=9),
+                       T.ColorJitter(0.4, 0.4, 0.4, 0.1),
+                       T.RandomApply([T.GaussianBlur(9, sigma=(0.1, 3.0))], p=0.3),
+                       T.ToTensor(), T.Normalize(MEAN, STD), T.RandomErasing(p=0.25)])
+TF_TRAIN = {"plain": TF_PLAIN, "robust": TF_ROBUST}
 TF_EVAL = T.Compose([T.Resize(256), T.CenterCrop(224), T.ToTensor(), T.Normalize(MEAN, STD)])
 
 
@@ -166,7 +177,7 @@ def make_model(n_classes, pretrained):
 
 
 def train(model, train_items, val_items, args, device):
-    dl = DataLoader(Files(train_items, TF_TRAIN), batch_size=args.bs, shuffle=True,
+    dl = DataLoader(Files(train_items, TF_TRAIN[args.aug]), batch_size=args.bs, shuffle=True,
                     num_workers=args.workers, drop_last=True)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs * len(dl))
@@ -223,19 +234,27 @@ def quantize_int8_real(model, calib_items, args):
     return m
 
 
-def quantize_int8_sim(model, calib_items, args, device):
-    """Exact INT8 simulation (fake quantization), independent of the CPU engine.
-    Same scheme as mobile runtimes: weights int8 per-channel symmetric,
+def quantize_sim(model, calib_items, args, device, w_bits=8):
+    """Exact quantization simulation (fake quantization), independent of the CPU engine.
+    Same scheme as mobile runtimes: weights signed per-channel symmetric (w_bits),
     activations uint8 per-tensor affine, ranges from the calibration images.
-    BatchNorm is folded into the convolutions before weights are rounded."""
-    print("Quantizing to INT8 (simulated: per-channel int8 weights, per-tensor uint8 activations)")
+    BatchNorm is folded into the convolutions before weights are rounded.
+    For w_bits < 8 the first convolution and the final classifier stay at 8 bits (standard practice)."""
+    label = "INT8" if w_bits == 8 else f"INT{w_bits} weights / INT8 activations"
+    print(f"Quantizing to {label} (simulated, per-channel weights, per-tensor uint8 activations)")
     act = tq.FakeQuantize.with_args(observer=tq.MinMaxObserver, quant_min=0, quant_max=255,
                                     dtype=torch.quint8, qscheme=torch.per_tensor_affine)
-    wt = tq.FakeQuantize.with_args(observer=tq.PerChannelMinMaxObserver, quant_min=-128, quant_max=127,
-                                   dtype=torch.qint8, qscheme=torch.per_channel_symmetric, ch_axis=0)
+    def wq(bits):
+        return tq.FakeQuantize.with_args(observer=tq.PerChannelMinMaxObserver,
+                                         quant_min=-(2 ** (bits - 1)), quant_max=2 ** (bits - 1) - 1,
+                                         dtype=torch.qint8, qscheme=torch.per_channel_symmetric, ch_axis=0)
+    q8 = tq.QConfig(activation=act, weight=wq(8))
     m = copy.deepcopy(model).cpu().train()
     m.fuse_model(is_qat=True)
-    m.qconfig = tq.QConfig(activation=act, weight=wt)
+    m.qconfig = tq.QConfig(activation=act, weight=wq(w_bits))
+    if w_bits < 8:
+        m.features[0].qconfig = q8        # first conv
+        m.classifier[3].qconfig = q8      # final classifier
     tq.prepare_qat(m, inplace=True)
     m.eval()                                       # BatchNorm uses its running statistics
     m.apply(tq.enable_observer); m.apply(tq.enable_fake_quant)
@@ -263,7 +282,7 @@ def quantize_int8(model, calib_items, val_items, fp_val_logits, y_val, args, dev
             if args.quant_mode == "real":
                 raise
             print(f"[!] Real INT8 failed on this machine: {e}\n    Falling back to exact INT8 simulation.")
-    return quantize_int8_sim(model, calib_items, args, device), device, "simulated"
+    return quantize_sim(model, calib_items, args, device, 8), device, "simulated"
 
 
 # ----------------------------------------------------------------------------
@@ -345,28 +364,55 @@ def flip_by_conf(fp_logits, q_logits, bins=(0, .5, .7, .9, .99, 1.0001)):
 
 
 # ----------------------------------------------------------------------------
+VARIANTS = {"q8": "INT8", "q4": "INT4-W"}
+CACHE_KEYS = ("pv", "pd", "epochs", "lr", "max_per_class", "calib_n", "seed", "no_pretrained",
+              "quant_mode", "aug", "field_cal_frac", "int4")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pv", required=True); ap.add_argument("--pd", required=True)
     ap.add_argument("--out", default="runs/pilot")
-    ap.add_argument("--epochs", type=int, default=5); ap.add_argument("--bs", type=int, default=64)
+    ap.add_argument("--epochs", type=int, default=10); ap.add_argument("--bs", type=int, default=64)
     ap.add_argument("--lr", type=float, default=3e-4); ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--max-per-class", type=int, default=400)
+    ap.add_argument("--max-per-class", type=int, default=1000, help="PlantVillage images per class (0 = all)")
+    ap.add_argument("--aug", choices=["plain", "robust"], default="robust")
     ap.add_argument("--calib-n", type=int, default=256, help="PV train images for PTQ calibration")
+    ap.add_argument("--field-cal-frac", type=float, default=0.2,
+                    help="share of PlantDoc held out (labels used) to fit a field temperature; rest = field test")
+    ap.add_argument("--no-int4", dest="int4", action="store_false", help="skip the INT4-weight variant")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--no-pretrained", action="store_true")
     ap.add_argument("--quant-mode", choices=["auto", "real", "sim"], default="auto",
-                    help="auto: real INT8 kernels if they work on this machine, else exact simulation")
+                    help="INT8: real integer kernels if they work on this machine, else exact simulation")
     ap.add_argument("--boot", type=int, default=1000)
     args = ap.parse_args()
+    if args.max_per_class <= 0:
+        args.max_per_class = 10 ** 9
 
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Device: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device == "cuda" else ""))
 
-    classes, pv, pd = build_index(args.pv, args.pd, args.max_per_class, args.seed)
+    # Cached stages are reused only if the settings that produced them are unchanged.
+    cfg = {k: getattr(args, k) for k in CACHE_KEYS}
+    cfg_path = out / "config.json"
+    cached = any((out / f).exists() for f in ("fp32.pt", "logits.npz"))
+    stale = cached and (not cfg_path.exists() or json.load(open(cfg_path)) != json.loads(json.dumps(cfg)))
+    if stale:
+        print("[!] Settings differ from the cached run in this folder (or it is from an older version): "
+              "retraining from scratch.")
+        for f in ("fp32.pt", "int8.pt", "int4w.pt", "logits.npz"):
+            (out / f).unlink(missing_ok=True)
+    json.dump(cfg, open(cfg_path, "w"), indent=1)
+
+    classes, pv, pd_all = build_index(args.pv, args.pd, args.max_per_class, args.seed)
     tr, va, te = stratified_split(pv, seed=args.seed)
+    pd_cal, _, pd = stratified_split(pd_all, fracs=(args.field_cal_frac, 0.0), seed=args.seed)
+    print(f"PV train/val/test: {len(tr)}/{len(va)}/{len(te)} | PD field-cal/field-test: {len(pd_cal)}/{len(pd)}")
     json.dump({"classes": classes}, open(out / "classes.json", "w"), indent=1)
+    sets = (("pv_val", va), ("pv_test", te), ("pd_cal", pd_cal), ("pd", pd))
 
     # --- FP32 ---------------------------------------------------------------
     ck = out / "fp32.pt"
@@ -381,85 +427,116 @@ def main():
         z = dict(np.load(cache)); print("Loaded", cache)
     else:
         z = {}
-        for name, items in (("pv_val", va), ("pv_test", te), ("pd", pd)):
+        for name, items in sets:
             z[f"fp_{name}"], z[f"y_{name}"] = get_logits(model, items, args, device)
-        # --- INT8 PTQ (runs on CPU, like the phone) -------------------------
         calib = random.Random(args.seed).sample(tr, min(args.calib_n, len(tr)))
+        # INT8: real integer kernels when they work here, else exact simulation
         qmodel, qdev, qmode = quantize_int8(model, calib, va, z["fp_pv_val"], z["y_pv_val"], args, device)
         torch.save(qmodel.state_dict(), out / "int8.pt")
-        for name, items in (("pv_val", va), ("pv_test", te), ("pd", pd)):
-            z[f"q_{name}"], _ = get_logits(qmodel, items, args, qdev)
-        for k in [k for k in z if k.startswith(("fp_", "q_"))]:
+        for name, items in sets:
+            z[f"q8_{name}"], _ = get_logits(qmodel, items, args, qdev)
+        z["quant_mode"] = np.array(qmode)
+        # INT4 weights (INT8 activations): simulated; no CPU kernels exist for this
+        if args.int4:
+            q4 = quantize_sim(model, calib, args, device, w_bits=4)
+            torch.save(q4.state_dict(), out / "int4w.pt")
+            for name, items in sets:
+                z[f"q4_{name}"], _ = get_logits(q4, items, args, device)
+        for k in [k for k in z if k.startswith(("fp_", "q8_", "q4_"))]:
             if not np.isfinite(z[k]).all():
                 raise SystemExit(f"Non-finite logits in {k}; please send this output to Claude.")
-        z["quant_mode"] = np.array(qmode)
         np.savez(cache, **z)
 
-    # --- Temperatures (source val only; post-quant refit = proposed fix) -----
-    t_fp = fit_temperature(z["fp_pv_val"], z["y_pv_val"])
-    t_q = fit_temperature(z["q_pv_val"], z["y_pv_val"])
-
+    variants = [v for v in VARIANTS if f"{v}_pd" in z]
     qmode = str(z.get("quant_mode", "real"))
-    print(f"INT8 mode: {qmode}")
-    res = {"quant_mode": qmode, "T_fp32": t_fp, "T_int8_refit": t_q, "n_classes": len(classes),
-           "n_pv_test": int(len(z["y_pv_test"])), "n_pd": int(len(z["y_pd"]))}
+    print(f"\nINT8 mode: {qmode}" + (" | INT4-W: simulated" if "q4" in variants else ""))
+    for v in variants:
+        acc_fp = (z["fp_pv_val"].argmax(1) == z["y_pv_val"]).mean()
+        acc_q = (z[f"{v}_pv_val"].argmax(1) == z["y_pv_val"]).mean()
+        if acc_q < acc_fp - 0.2:
+            print(f"[!] {VARIANTS[v]} lab accuracy collapsed ({acc_q:.3f} vs FP32 {acc_fp:.3f}).")
+
+    # --- Temperatures --------------------------------------------------------
+    # source: fitted on lab validation (no field data); field: fitted on the labeled field-cal split
+    T = {"FP32": {"source": fit_temperature(z["fp_pv_val"], z["y_pv_val"]),
+                  "field": fit_temperature(z["fp_pd_cal"], z["y_pd_cal"])}}
+    for v in variants:
+        T[VARIANTS[v]] = {"source_refit": fit_temperature(z[f"{v}_pv_val"], z["y_pv_val"]),
+                          "field": fit_temperature(z[f"{v}_pd_cal"], z["y_pd_cal"])}
+
+    res = {"quant_mode": qmode, "variants": [VARIANTS[v] for v in variants], "T": T,
+           "n_classes": len(classes), "n_pv_train": len(tr), "n_pv_test": int(len(z["y_pv_test"])),
+           "n_pd_cal": int(len(z["y_pd_cal"])), "n_pd": int(len(z["y_pd"])),
+           "settings": {k: v for k, v in cfg.items() if k not in ("pv", "pd")}}
     rows = []
     for ds in ("pv_test", "pd"):
         y = z[f"y_{ds}"]
-        for label, lg, t in (("FP32 raw", z[f"fp_{ds}"], 1.0),
-                             ("INT8 raw", z[f"q_{ds}"], 1.0),
-                             ("FP32 +T", z[f"fp_{ds}"], t_fp),
-                             ("INT8 +T(fp32)", z[f"q_{ds}"], t_fp),
-                             ("INT8 +T(refit)", z[f"q_{ds}"], t_q)):
+        conds = [("FP32 raw", z[f"fp_{ds}"], 1.0),
+                 ("FP32 +T(source)", z[f"fp_{ds}"], T["FP32"]["source"]),
+                 ("FP32 +T(field)", z[f"fp_{ds}"], T["FP32"]["field"])]
+        for v in variants:
+            n = VARIANTS[v]
+            conds += [(f"{n} raw", z[f"{v}_{ds}"], 1.0),
+                      (f"{n} +T(fp32 source)", z[f"{v}_{ds}"], T["FP32"]["source"]),
+                      (f"{n} +T(refit source)", z[f"{v}_{ds}"], T[n]["source_refit"]),
+                      (f"{n} +T(field)", z[f"{v}_{ds}"], T[n]["field"])]
+        for label, lg, t in conds:
             m = all_metrics(lg, y, t); m.update(dataset=ds, model=label); rows.append(m)
     res["table"] = rows
 
-    print(f"\nT_fp32={t_fp:.3f}  T_int8_refit={t_q:.3f}")
+    print("\nTemperatures:", json.dumps({k: {a: round(b, 3) for a, b in d.items()} for k, d in T.items()}))
     hdr = ["dataset", "model", "acc", "macro_f1", "ece", "nll", "aurc", "acc_at_80", "err_auroc", "conf_wrong"]
-    print("\n" + " | ".join(f"{h:>14}" for h in hdr))
+    print("\n" + " | ".join(f"{h:>20}" if h == "model" else f"{h:>9}" for h in hdr))
     for r in rows:
-        print(" | ".join(f"{r[h]:>14.4f}" if isinstance(r[h], float) else f"{r[h]:>14}" for h in hdr))
+        print(" | ".join(f"{r[h]:>9.4f}" if isinstance(r[h], float) else
+                         (f"{r[h]:>20}" if h == "model" else f"{r[h]:>9}") for h in hdr))
 
-    print("\nFlip rate (FP32 vs INT8 disagree), by FP32 confidence:")
-    res["flip"] = {}
-    for ds in ("pv_test", "pd"):
-        tot, fr = flip_by_conf(z[f"fp_{ds}"], z[f"q_{ds}"]); res["flip"][ds] = {"overall": tot, "bins": fr}
-        print(f"  {ds}: overall {tot:.4f}  " + "  ".join(f"[{b}] n={n} {f:.3f}" for b, n, f in fr))
-
-    print(f"\nShift gap = (INT8-FP32 on PlantDoc) - (INT8-FP32 on PlantVillage), raw softmax, {args.boot} bootstraps:")
-    res["gap"] = {}
-    for key in ("acc", "ece", "aurc", "err_auroc"):
-        g = bootstrap_gap(z["fp_pv_test"], z["q_pv_test"], z["y_pv_test"],
-                          z["fp_pd"], z["q_pd"], z["y_pd"], key, 1.0, 1.0, n=args.boot)
-        res["gap"][key] = g
-        print(f"  {key:>10}: {g[0]:+.4f}  95% CI [{g[1]:+.4f}, {g[2]:+.4f}]")
-
-    # Rough decision hint, not a statistical test of the paper's claims.
-    e, a = res["gap"]["ece"], res["gap"]["aurc"]
-    if e[1] > 0 or a[1] > 0:
-        hint = "GO: quantization measurably hurts reliability more under shift (CI excludes 0)."
-    elif e[0] > 0.005 or a[0] > 0.005:
-        hint = "LEAN GO: gap points the expected way but CI includes 0; add seeds / more PD data."
-    else:
-        hint = "NULL so far: INT8 doesn't widen the gap. Pivot headline to INT4 / calibration-set choice."
-    res["hint"] = hint; print("\n" + hint)
+    res["flip"], res["gap"], res["hint"] = {}, {}, {}
+    for v in variants:
+        n = VARIANTS[v]
+        print(f"\nFlip rate (FP32 vs {n} disagree), by FP32 confidence:")
+        res["flip"][n] = {}
+        for ds in ("pv_test", "pd"):
+            tot, fr = flip_by_conf(z[f"fp_{ds}"], z[f"{v}_{ds}"]); res["flip"][n][ds] = {"overall": tot, "bins": fr}
+            print(f"  {ds:>7}: overall {tot:.4f}  " + "  ".join(f"[{b}] n={c} {f:.3f}" for b, c, f in fr))
+        print(f"Shift gap = ({n}-FP32 on PlantDoc) - ({n}-FP32 on PlantVillage), raw softmax, {args.boot} bootstraps:")
+        res["gap"][n] = {}
+        for key in ("acc", "ece", "aurc", "err_auroc"):
+            g = bootstrap_gap(z["fp_pv_test"], z[f"{v}_pv_test"], z["y_pv_test"],
+                              z["fp_pd"], z[f"{v}_pd"], z["y_pd"], key, 1.0, 1.0, n=args.boot)
+            res["gap"][n][key] = g
+            print(f"  {key:>10}: {g[0]:+.4f}  95% CI [{g[1]:+.4f}, {g[2]:+.4f}]")
+        # Rough decision hint, not a statistical test of the paper's claims.
+        e, a = res["gap"][n]["ece"], res["gap"][n]["aurc"]
+        if e[1] > 0 or a[1] > 0:
+            hint = f"GO: {n} measurably hurts reliability more under shift (CI excludes 0)."
+        elif e[0] > 0.005 or a[0] > 0.005:
+            hint = f"LEAN GO: {n} gap points the expected way but CI includes 0; add seeds."
+        else:
+            hint = f"NULL: {n} doesn't widen the lab-to-field reliability gap."
+        res["hint"][n] = hint; print(hint)
     json.dump(res, open(out / "results.json", "w"), indent=1, default=float)
 
     # --- Plots ---------------------------------------------------------------
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+    cols = {"fp": "#2563eb", "q8": "#dc2626", "q4": "#f59e0b"}
+    names = {"fp": "FP32", **VARIANTS}
+    fig, ax = plt.subplots(1, 1 + len(variants), figsize=(5 * (1 + len(variants)), 4))
     for ds, ls in (("pv_test", "-"), ("pd", "--")):
         y = z[f"y_{ds}"]
-        for tag, col in (("fp", "#2563eb"), ("q", "#dc2626")):
+        for tag in ["fp"] + variants:
             p = softmax(z[f"{tag}_{ds}"]); cov, risk = risk_curve(p.max(1), (p.argmax(1) == y).astype(float))
-            ax[0].plot(cov, risk, ls, color=col, label=f"{'FP32' if tag=='fp' else 'INT8'} {ds}")
-    ax[0].set(xlabel="coverage", ylabel="risk (error rate)", title="Risk-coverage"); ax[0].legend()
+            ax[0].plot(cov, risk, ls, color=cols[tag], label=f"{names[tag]} {'lab' if ds == 'pv_test' else 'field'}")
+    ax[0].set(xlabel="coverage", ylabel="risk (error rate)", title="Risk-coverage"); ax[0].legend(fontsize=8)
     w = 0.38
-    for k, (ds, col) in enumerate((("pv_test", "#64748b"), ("pd", "#ea580c"))):
-        fr = res["flip"][ds]["bins"]
-        ax[1].bar(np.arange(len(fr)) + (k - .5) * w, [f for _, _, f in fr], w, color=col, label=ds)
-    ax[1].set_xticks(range(len(fr)), [b for b, _, _ in fr], rotation=20)
-    ax[1].set(xlabel="FP32 confidence", ylabel="flip rate", title="Where INT8 changes the answer"); ax[1].legend()
+    for i, v in enumerate(variants, 1):
+        for k, (ds, col) in enumerate((("pv_test", "#64748b"), ("pd", "#ea580c"))):
+            fr = res["flip"][VARIANTS[v]][ds]["bins"]
+            ax[i].bar(np.arange(len(fr)) + (k - .5) * w, [f for _, _, f in fr], w, color=col,
+                      label="lab" if ds == "pv_test" else "field")
+        ax[i].set_xticks(range(len(fr)), [b for b, _, _ in fr], rotation=20)
+        ax[i].set(xlabel="FP32 confidence", ylabel="flip rate", title=f"Where {VARIANTS[v]} changes the answer")
+        ax[i].legend()
     fig.tight_layout(); fig.savefig(out / "pilot.png", dpi=150)
     print("Saved", out / "results.json", "and", out / "pilot.png")
 
