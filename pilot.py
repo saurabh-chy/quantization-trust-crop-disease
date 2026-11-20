@@ -14,7 +14,7 @@ Usage:
 
 Stages are cached in --out, so re-running skips training/conversion.
 """
-import argparse, json, os, random, re, time, warnings
+import argparse, copy, json, os, random, re, time, warnings
 from pathlib import Path
 
 import numpy as np
@@ -210,16 +210,60 @@ def pick_quant_engine():
                      f"(supported_engines={torch.backends.quantized.supported_engines}).\n" + "\n".join(tried))
 
 
-def quantize_int8(model, calib_items, args):
+def quantize_int8_real(model, calib_items, args):
+    """True INT8 model using PyTorch's CPU integer kernels (static PTQ)."""
     engine = pick_quant_engine()
-    print(f"Quantizing to INT8 with engine: {engine}")
-    m = model.cpu().eval()
+    print(f"Quantizing to INT8 (real integer kernels) with engine: {engine}")
+    m = copy.deepcopy(model).cpu().eval()
     m.fuse_model(is_qat=False)
     m.qconfig = tq.get_default_qconfig(engine)
     tq.prepare(m, inplace=True)
     get_logits(m, calib_items, args, "cpu")  # observers collect activation ranges
     tq.convert(m, inplace=True)
     return m
+
+
+def quantize_int8_sim(model, calib_items, args, device):
+    """Exact INT8 simulation (fake quantization), independent of the CPU engine.
+    Same scheme as mobile runtimes: weights int8 per-channel symmetric,
+    activations uint8 per-tensor affine, ranges from the calibration images.
+    BatchNorm is folded into the convolutions before weights are rounded."""
+    print("Quantizing to INT8 (simulated: per-channel int8 weights, per-tensor uint8 activations)")
+    act = tq.FakeQuantize.with_args(observer=tq.MinMaxObserver, quant_min=0, quant_max=255,
+                                    dtype=torch.quint8, qscheme=torch.per_tensor_affine)
+    wt = tq.FakeQuantize.with_args(observer=tq.PerChannelMinMaxObserver, quant_min=-128, quant_max=127,
+                                   dtype=torch.qint8, qscheme=torch.per_channel_symmetric, ch_axis=0)
+    m = copy.deepcopy(model).cpu().train()
+    m.fuse_model(is_qat=True)
+    m.qconfig = tq.QConfig(activation=act, weight=wt)
+    tq.prepare_qat(m, inplace=True)
+    m.eval()                                       # BatchNorm uses its running statistics
+    m.apply(tq.enable_observer); m.apply(tq.enable_fake_quant)
+    get_logits(m, calib_items, args, device)       # collect activation ranges
+    m.apply(tq.disable_observer)                   # freeze ranges, keep rounding on
+    return m
+
+
+def quantize_int8(model, calib_items, val_items, fp_val_logits, y_val, args, device):
+    """Real INT8 when this machine's integer kernels work; otherwise exact simulation.
+    Returns (model, logits_device, mode)."""
+    if args.quant_mode in ("auto", "real"):
+        try:
+            qm = quantize_int8_real(model, calib_items, args)
+            lg, _ = get_logits(qm, val_items, args, "cpu")
+            fp_acc = (fp_val_logits.argmax(1) == y_val).mean()
+            q_acc = (lg.argmax(1) == y_val).mean()
+            if not np.isfinite(lg).all():
+                raise RuntimeError("INT8 model produced NaN/inf outputs")
+            if q_acc < fp_acc - 0.2:
+                raise RuntimeError(f"INT8 accuracy collapsed ({q_acc:.3f} vs FP32 {fp_acc:.3f}); "
+                                   "likely a kernel bug for this model on this engine")
+            return qm, "cpu", "real"
+        except (RuntimeError, SystemExit) as e:
+            if args.quant_mode == "real":
+                raise
+            print(f"[!] Real INT8 failed on this machine: {e}\n    Falling back to exact INT8 simulation.")
+    return quantize_int8_sim(model, calib_items, args, device), device, "simulated"
 
 
 # ----------------------------------------------------------------------------
@@ -311,6 +355,8 @@ def main():
     ap.add_argument("--calib-n", type=int, default=256, help="PV train images for PTQ calibration")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--no-pretrained", action="store_true")
+    ap.add_argument("--quant-mode", choices=["auto", "real", "sim"], default="auto",
+                    help="auto: real INT8 kernels if they work on this machine, else exact simulation")
     ap.add_argument("--boot", type=int, default=1000)
     args = ap.parse_args()
 
@@ -339,17 +385,23 @@ def main():
             z[f"fp_{name}"], z[f"y_{name}"] = get_logits(model, items, args, device)
         # --- INT8 PTQ (runs on CPU, like the phone) -------------------------
         calib = random.Random(args.seed).sample(tr, min(args.calib_n, len(tr)))
-        qmodel = quantize_int8(model, calib, args)
+        qmodel, qdev, qmode = quantize_int8(model, calib, va, z["fp_pv_val"], z["y_pv_val"], args, device)
         torch.save(qmodel.state_dict(), out / "int8.pt")
         for name, items in (("pv_val", va), ("pv_test", te), ("pd", pd)):
-            z[f"q_{name}"], _ = get_logits(qmodel, items, args, "cpu")
+            z[f"q_{name}"], _ = get_logits(qmodel, items, args, qdev)
+        for k in [k for k in z if k.startswith(("fp_", "q_"))]:
+            if not np.isfinite(z[k]).all():
+                raise SystemExit(f"Non-finite logits in {k}; please send this output to Claude.")
+        z["quant_mode"] = np.array(qmode)
         np.savez(cache, **z)
 
     # --- Temperatures (source val only; post-quant refit = proposed fix) -----
     t_fp = fit_temperature(z["fp_pv_val"], z["y_pv_val"])
     t_q = fit_temperature(z["q_pv_val"], z["y_pv_val"])
 
-    res = {"T_fp32": t_fp, "T_int8_refit": t_q, "n_classes": len(classes),
+    qmode = str(z.get("quant_mode", "real"))
+    print(f"INT8 mode: {qmode}")
+    res = {"quant_mode": qmode, "T_fp32": t_fp, "T_int8_refit": t_q, "n_classes": len(classes),
            "n_pv_test": int(len(z["y_pv_test"])), "n_pd": int(len(z["y_pd"]))}
     rows = []
     for ds in ("pv_test", "pd"):
