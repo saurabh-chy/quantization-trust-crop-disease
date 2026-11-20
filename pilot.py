@@ -196,9 +196,23 @@ def get_logits(model, items, args, device="cpu"):
     return torch.cat(L).numpy(), torch.cat(Y).numpy()
 
 
+def pick_quant_engine():
+    """Use the first INT8 CPU engine this PyTorch build can actually run.
+    x86/fbgemm on Intel/AMD CPUs (Windows, Linux), qnnpack on ARM (Mac M-series, phones)."""
+    tried = []
+    for e in ("x86", "fbgemm", "onednn", "qnnpack"):
+        try:
+            torch.backends.quantized.engine = e
+            return e
+        except RuntimeError as err:
+            tried.append(f"{e}: {err}")
+    raise SystemExit("No quantized engine works in this PyTorch build "
+                     f"(supported_engines={torch.backends.quantized.supported_engines}).\n" + "\n".join(tried))
+
+
 def quantize_int8(model, calib_items, args):
-    engine = "x86" if "x86" in torch.backends.quantized.supported_engines else "qnnpack"
-    torch.backends.quantized.engine = engine
+    engine = pick_quant_engine()
+    print(f"Quantizing to INT8 with engine: {engine}")
     m = model.cpu().eval()
     m.fuse_model(is_qat=False)
     m.qconfig = tq.get_default_qconfig(engine)
